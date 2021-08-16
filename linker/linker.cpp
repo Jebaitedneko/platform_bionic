@@ -644,6 +644,68 @@ enum walk_action_result_t : uint32_t {
   kWalkSkip = 2
 };
 
+#ifdef LD_SHIM_LIBS
+// g_ld_all_shim_libs maintains the references to memory as it used
+// in the soinfo structures and in the g_active_shim_libs list.
+
+static std::vector<ShimDescriptor> g_ld_all_shim_libs;
+
+// g_active_shim_libs are all shim libs that are still eligible
+// to be loaded.  We must remove a shim lib from the list before
+// we load the library to avoid recursive loops (load shim libA
+// for libB where libA also links against libB).
+static linked_list_t<const ShimDescriptor> g_active_shim_libs;
+
+static void reset_g_active_shim_libs(void) {
+  g_active_shim_libs.clear();
+  for (const auto& pair : g_ld_all_shim_libs) {
+    g_active_shim_libs.push_back(&pair);
+  }
+}
+
+void parse_LD_SHIM_LIBS(const char* path) {
+  g_ld_all_shim_libs.clear();
+  if (path != nullptr) {
+    for (const auto& pair : android::base::Split(path, ":")) {
+      std::vector<std::string> pieces = android::base::Split(pair, "|");
+      if (pieces.size() != 2) continue;
+      // If the path can be resolved, resolve it
+      char buf[PATH_MAX];
+      std::string resolved_path = pieces[0];
+      if (access(pieces[0].c_str(), R_OK) != 0) {
+        if (errno == ENOENT) {
+          // no need to test for non-existing path. skip.
+          continue;
+        }
+        // If not accessible, don't call realpath as it will just cause
+        // SELinux denial spam. Use the path unresolved.
+      } else if (realpath(pieces[0].c_str(), buf) != nullptr) {
+        resolved_path = buf;
+      }
+      auto desc = std::pair<std::string, std::string>(resolved_path, pieces[1]);
+      g_ld_all_shim_libs.push_back(desc);
+    }
+  }
+  reset_g_active_shim_libs();
+}
+
+std::vector<const ShimDescriptor*> shim_matching_pairs(const char* path) {
+  std::vector<const ShimDescriptor*> matched_pairs;
+
+  g_active_shim_libs.for_each([&](const ShimDescriptor* a_pair) {
+    if (a_pair->first == path) {
+      matched_pairs.push_back(a_pair);
+    }
+  });
+
+  g_active_shim_libs.remove_if([&](const ShimDescriptor* a_pair) {
+    return a_pair->first == path;
+  });
+
+  return matched_pairs;
+}
+#endif
+
 // This function walks down the tree of soinfo dependencies
 // in breadth-first order and
 //   * calls action(soinfo* si) for each node, and
@@ -1279,6 +1341,12 @@ static bool load_library(android_namespace_t* ns,
   }
 #endif
 
+#ifdef LD_SHIM_LIBS
+  for_each_matching_shim(realpath.c_str(), [&](const char* name) {
+    load_tasks->push_back(LoadTask::create(name, si, ns, task->get_readers_map()));
+  });
+#endif
+
   for_each_dt_needed(task->get_elf_reader(), [&](const char* name) {
     LD_LOG(kLogDlopen, "load_library(ns=%s, task=%s): Adding DT_NEEDED task: %s",
            ns->get_name(), task->get_name(), name);
@@ -1352,8 +1420,7 @@ static bool find_loaded_library_by_soname(android_namespace_t* ns,
                                           const char* name,
                                           soinfo** candidate) {
   return !ns->soinfo_list().visit([&](soinfo* si) {
-    const char* soname = si->get_soname();
-    if (soname != nullptr && (strcmp(name, soname) == 0)) {
+    if (strcmp(name, si->get_soname()) == 0) {
       *candidate = si;
       return false;
     }
@@ -2181,6 +2248,9 @@ void* do_dlopen(const char* name, int flags,
   }
 
   ProtectedDataGuard guard;
+#ifdef LD_SHIM_LIBS
+  reset_g_active_shim_libs();
+#endif
   soinfo* si = find_library(ns, translated_name, flags, extinfo, caller);
   loading_trace.End();
 
@@ -2577,9 +2647,8 @@ bool VersionTracker::init_verneed(const soinfo* si_from) {
 
     const char* target_soname = si_from->get_string(verneed->vn_file);
     // find it in dependencies
-    soinfo* target_si = si_from->get_children().find_if([&](const soinfo* si) {
-      return si->get_soname() != nullptr && strcmp(si->get_soname(), target_soname) == 0;
-    });
+    soinfo* target_si = si_from->get_children().find_if(
+        [&](const soinfo* si) { return strcmp(si->get_soname(), target_soname) == 0; });
 
     if (target_si == nullptr) {
       DL_ERR("cannot find \"%s\" from verneed[%zd] in DT_NEEDED list for \"%s\"",
@@ -3212,15 +3281,12 @@ bool soinfo::prelink_image() {
   // for apps targeting sdk version < M.) Make an exception for
   // the main executable and linker; they do not need to have dt_soname.
   // TODO: >= O the linker doesn't need this workaround.
-  if (soname_ == nullptr &&
-      this != solist_get_somain() &&
-      (flags_ & FLAG_LINKER) == 0 &&
+  if (soname_.empty() && this != solist_get_somain() && (flags_ & FLAG_LINKER) == 0 &&
       get_application_target_sdk_version() < 23) {
     soname_ = basename(realpath_.c_str());
-    DL_WARN_documented_change(23,
-                              "missing-soname-enforced-for-api-level-23",
-                              "\"%s\" has no DT_SONAME (will use %s instead)",
-                              get_realpath(), soname_);
+    DL_WARN_documented_change(23, "missing-soname-enforced-for-api-level-23",
+                              "\"%s\" has no DT_SONAME (will use %s instead)", get_realpath(),
+                              soname_.c_str());
 
     // Don't call add_dlwarning because a missing DT_SONAME isn't important enough to show in the UI
   }
@@ -3530,7 +3596,18 @@ std::vector<android_namespace_t*> init_default_namespaces(const char* executable
     }
   }
 
-  set_application_target_sdk_version(config->target_sdk_version());
+  uint32_t target_sdk = config->target_sdk_version();
+#ifdef SDK_VERSION_OVERRIDES
+  for (const auto& entry : android::base::Split(SDK_VERSION_OVERRIDES, " ")) {
+    auto splitted = android::base::Split(entry, "=");
+    if (splitted.size() == 2 && splitted[0] == executable_path) {
+      target_sdk = static_cast<uint32_t>(std::stoul(splitted[1]));
+      break;
+    }
+  }
+  DEBUG("Target SDK for %s = %d", executable_path, target_sdk);
+#endif
+  set_application_target_sdk_version(target_sdk);
 
   std::vector<android_namespace_t*> created_namespaces;
   created_namespaces.reserve(namespaces.size());
